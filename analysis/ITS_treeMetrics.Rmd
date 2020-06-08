@@ -1,0 +1,103 @@
+---
+title: "ITS_treeMetrics"
+author: "ajb474"
+date: "2020-06-07"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+```{r Load Packages & Data, results = "hide"}
+pacman::p_load("rLiDAR","lidR","raster","rgdal","dplyr")
+# Load the SfM point cloud (file is provided in 'data' directory)
+las.raw <- lidR::readLAS("data/sfm_pointcloud.las")
+```
+
+
+```{r Classify Points & Create DTM}
+# Let's have a look at the raw point cloud
+#lidR::plot(las.raw)
+
+# Assign the point return values with '1' to prevent processing issues (a SfM point cloud doesn't technically have a return number since the points are image-derived)
+las.raw@data$ReturnNumber[las.raw@data$ReturnNumber == 0] <- 1
+
+# Assign the point cloud a reference coordinate system, the data for this example are located in UTM Zone 12N (outside of Flagstaff, AZ, USA)
+crs(las.raw) <- "+init=epsg:32612"
+
+# The first step requires separating the ground and non-ground points from one another using the 'Cloth Simulation Filter' method.
+mycsf <- csf(sloop_smooth = TRUE, class_threshold = 1.37, cloth_resolution = 1,rigidness = 2)
+las.raw <- lasground(las.raw, mycsf)
+
+# Have a look at the classification, and notice that the non-ground points are mostly trees and some debris on the ground surface (rocks, understory vegetation, etc.)
+#plot(las.raw, color="Classification")
+
+# Now, create a digital terrain model (DTM) so that the points can be 'normalized'. This almost literally puts all points on a level playing field, ensuring that a point's height off the ground can be compared across the entire point cloud.
+dtm <- grid_terrain(las.raw, algorithm = knnidw(k = 11, p = 2))
+# As before, assign it a coordinate reference system and have a look at it.
+crs(dtm) <- "+init=epsg:32612"
+plot(dtm, main = "Digital Terrain Model (DTM)",legend.args = list(text = 'Elevation (m)'))
+```
+
+
+```{r Normalize and Segment Trees}
+# Now we can normalize the point cloud using the DTM.
+las.norm <- lasnormalize(las.raw, dtm)
+# Here we assign values with height values less than 0 to be 0. This ensures that any below ground 'noise' doesn't get incorporated into the final result. This below ground noise is common in SfM point clouds where the ground isn't always visible and other quality issues arise.
+las.norm@data$Z[las.norm@data$Z < 0] <- 0
+# Since the method we are using to perform the individual tree segementation (Li et al., 2010) doesn't require using a canopy height model, we are just making this to help visualize the data (and for fun!).
+chm <- grid_canopy(las.norm, res = 0.25, pitfree(thresholds = c(0,2,5,10,15), max_edge =  c(0,1), subcircle = 0.2))
+chm.col <- height.colors(50)
+plot(chm, col = chm.col, legend.args = list(text = 'Height (m)'))
+# Now we can perform the individual tree segmentation using the Li method with some data-specific parameters. Once finished, we get rid of some of the 'bogus' data and show the points above the understory relic points.
+las.trees <- lastrees(las.norm, li2012(dt1= 1.3, dt2= 1.8, hmin = 1.37, R = 2))
+las.trees <- lasfilter(las.trees, !is.na(treeID))
+test <- lasfilter(las.trees, Z > 0.5)
+#plot(test, color = "treeID")
+```
+
+
+```{r Calculate Tree Structure Metrics}
+# create dataframe from segmented point cloud
+las.trees.df <- data.frame(X = las.trees@data$X,
+                           Y = las.trees@data$Y,
+                           Z = las.trees@data$Z,
+                           Classification = las.trees@data$Classification,
+                           treeID = las.trees@data$treeID)
+# create a dataframe that summarizes the trees segmented point cloud
+las.trees.summary <- data.frame(treeID=unique(las.trees.df$treeID),
+                             count=table(las.trees.df$treeID),
+                             max=aggregate(las.trees.df$Z,
+                             by=list(las.trees.df$treeID),
+                             FUN=max))
+las.trees.summary <- data.frame(cbind(las.trees.summary[,1],
+                                   las.trees.summary[,3],
+                                   las.trees.summary[,5]))
+colnames(las.trees.summary) <- c("treeID","count","max")
+
+# Select Tree IDs that match criteria
+## Set criteria
+min_points <- 30
+min_z <- 1.37
+## Select only those treeIDs
+params <- las.trees.summary[which(las.trees.summary$count > min_points & las.trees.summary$max > min_z),]
+# Use param to limit treeIDs in the point cloud
+las.trees.clean <- las.trees.df[which(las.trees.df$treeID %in% params$treeID),]
+#plot, if needed
+#plot(las.trees, color = "treeID", colorPalette = pastel.colors(100))
+#run the crown metrics for each segemented tree
+trees.metrics <- rLiDAR::CrownMetrics(las.trees.clean)
+# print more digits to prevent rounding UTMs
+options(digits = 10)
+trees.metrics.df <- data.frame(matrix(unlist(trees.metrics), nrow = length(trees.metrics$Tree)))
+colnames(trees.metrics.df) <- colnames(trees.metrics)
+# create shapefile of segmented trees with their metrics as attributes
+trees.spatialpoints <- SpatialPointsDataFrame(trees.metrics.df[,3:4], data = trees.metrics.df[,1:39], proj4string = CRS("+init=epsg:32612"))
+
+chm.col <- height.colors(50)
+plot(chm, col = chm.col, legend.args = list(text = 'Height (m)'))
+points(trees.spatialpoints, pch = 4, cex = 1.5, lwd = 2)
+rgdal::writeOGR(trees.spatialpoints, "/data", "trees", driver = "ESRI Shapefile", overwrite_layer = TRUE)
+```
+
